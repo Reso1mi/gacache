@@ -1,7 +1,7 @@
-package main
+package gacache
 
 import (
-	"gcache/lru"
+	"gacache/lru"
 	"sync"
 )
 

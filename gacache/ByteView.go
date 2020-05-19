@@ -1,9 +1,9 @@
-package main
+package gacache
 
 //抽象一个只读的数据结构
 //[]byte是切片，传递都是直接传递的指针，需要避免被修改，所以需要拷贝i一份
 type ByteView struct {
-	b []byte
+	b []byte //包私有
 }
 
 //实现Value接口

@@ -1,4 +1,4 @@
-package main
+package gacache
 
 import (
 	"fmt"
@@ -69,10 +69,11 @@ func (g *Group) load(key string) (ByteView, error) {
 
 //从数据源获取数据
 func (g *Group) getLocally(key string) (ByteView, error) {
-	bytes, err := g.getter.Get(key)
+	bytes, err := g.getter.Get(key) //回调函数，从数据源取数据
 	if err != nil {
 		return ByteView{}, err
 	}
+	//将数据源的数据拷贝一份放入cache中，防止其他外部程序占有该数据并修改
 	value := ByteView{b: cloneBytes(bytes)}
 	g.populateCache(key, value)
 	return value, nil
