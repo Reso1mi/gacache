@@ -2,6 +2,7 @@ package gacache
 
 import (
 	"fmt"
+	"gacache/singleflight"
 	"log"
 	"sync"
 )
@@ -21,6 +22,8 @@ type Group struct {
 	getter    Getter
 	mainCache cache
 	peers     PeerPicker
+	//singleflight并发请求控制
+	loader *singleflight.Group
 }
 
 var (
@@ -39,6 +42,7 @@ func NewGroup(name string, cacheByte int64, getter Getter) *Group {
 		name:      name,
 		getter:    getter,
 		mainCache: cache{cacheBytes: cacheByte},
+		loader:    &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
@@ -65,17 +69,24 @@ func (g *Group) Get(key string) (ByteView, error) {
 }
 
 func (g *Group) load(key string) (value ByteView, err error) {
-	if g.peers != nil {
-		//根据一致性Hash选择节点Peer
-		if peer, ok := g.peers.PickPeer(key); ok {
-			//从上面的Peer中获取数据
-			if value, err = g.getFromPeer(peer, key); err == nil {
-				return value, nil
+	//通过singleflight去加载
+	view, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			//根据一致性Hash选择节点Peer
+			if peer, ok := g.peers.PickPeer(key); ok {
+				//从上面的Peer中获取数据
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[Gacache] Fail to get from remote peer!!!", err)
 			}
-			log.Println("[Gacache] Fail to get from remote peer!!!", err)
 		}
+		return g.getLocally(key)
+	})
+	if err == nil {
+		return view.(ByteView), nil
 	}
-	return g.getLocally(key)
+	return
 }
 
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
