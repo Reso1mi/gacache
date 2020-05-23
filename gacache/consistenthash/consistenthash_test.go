@@ -1,10 +1,18 @@
 package consistenthash
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 )
 
+func TestHash(t *testing.T) {
+	hash := New(3, nil)
+	addrs := []string{"http://localhost:8004", "http://localhost:8003", "http://localhost:8002", "http://localhost:8001"}
+	hash.Add(addrs...)
+	fmt.Println(hash.keys)
+	fmt.Println(hash.hash([]byte("tom")))
+}
 func TestHashing(t *testing.T) {
 	hash := New(3, func(key []byte) uint32 {
 		//自定义hash直接返回原节点数字编号

@@ -20,6 +20,7 @@ type Group struct {
 	name      string
 	getter    Getter
 	mainCache cache
+	peers     PeerPicker
 }
 
 var (
@@ -59,12 +60,31 @@ func (g *Group) Get(key string) (ByteView, error) {
 		log.Printf("[GaCache] hit")
 		return v, nil
 	}
-	//当前节点没有数据
+	//当前节点没有数据,去其他地方加载
 	return g.load(key)
 }
 
-func (g *Group) load(key string) (ByteView, error) {
+func (g *Group) load(key string) (value ByteView, err error) {
+	if g.peers != nil {
+		//根据一致性Hash选择节点Peer
+		if peer, ok := g.peers.PickPeer(key); ok {
+			//从上面的Peer中获取数据
+			if value, err = g.getFromPeer(peer, key); err == nil {
+				return value, nil
+			}
+			log.Println("[Gacache] Fail to get from remote peer!!!", err)
+		}
+	}
 	return g.getLocally(key)
+}
+
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	fmt.Println("getFromPeer", key)
+	bytes, err := peer.Get(g.name, key)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: bytes}, nil
 }
 
 //从数据源获取数据
@@ -82,4 +102,11 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 //将从数据源获取的数据加入cache
 func (g *Group) populateCache(key string, value ByteView) {
 	g.mainCache.put(key, value)
+}
+
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeers called more than once ! ! !")
+	}
+	g.peers = peers
 }
