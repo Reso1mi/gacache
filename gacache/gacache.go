@@ -2,6 +2,7 @@ package gacache
 
 import (
 	"fmt"
+	pb "gacache/gacachepb"
 	"gacache/singleflight"
 	"log"
 	"sync"
@@ -89,13 +90,21 @@ func (g *Group) load(key string) (value ByteView, err error) {
 	return
 }
 
+//从远程节点获取数据
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	//构建proto的message
+	req := &pb.Request{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &pb.Response{}
+	err := peer.Get(req, res)
+
 	fmt.Println("getFromPeer", key)
-	bytes, err := peer.Get(g.name, key)
 	if err != nil {
 		return ByteView{}, err
 	}
-	return ByteView{b: bytes}, nil
+	return ByteView{b: res.Value}, nil
 }
 
 //从数据源获取数据

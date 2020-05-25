@@ -1,0 +1,18 @@
+syntax = "proto3";
+package gacachepb;
+
+message Request{
+    string group =1;
+    string key = 2;
+}
+
+message Response{
+    bytes value=1;
+}
+
+service GroupCache{
+    rpc Get(Request) returns (Response);
+}
+
+
+
