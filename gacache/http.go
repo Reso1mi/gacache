@@ -104,7 +104,7 @@ type httpGetter struct {
 	baseURL string
 }
 
-//通过节点地址和groupName以及key构成的地址请求数据,通过proto编码数据
+//通过节点地址和groupName以及key构成的地址请求数据,通过proto解码数据
 func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",

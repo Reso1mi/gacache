@@ -11,8 +11,8 @@ type Hash func(data []byte) uint32
 type Map struct {
 	hash     Hash           //hash函数
 	replicas int            //虚拟节点倍数
-	keys     []int          //keys,完整的 协议/ip/port [eg. http://localhost:8004]
-	hashMap  map[int]string //虚拟节点和真实节点映射
+	keys     []int          //节点的地址,完整的协议/ip/port [eg. http://localhost:8001]
+	hashMap  map[int]string //虚拟节点和真实节点映射关系
 }
 
 func New(replicas int, fn Hash) *Map {

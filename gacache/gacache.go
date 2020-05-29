@@ -6,12 +6,17 @@ import (
 	"gacache/singleflight"
 	"log"
 	"sync"
+	"time"
 )
 
+//cache miss时候的回调接口
 type Getter interface {
 	Get(key string) ([]byte, error)
 }
 
+//cache miss时候的回调函数，实现了上面的回调接口，方便调用者将匿名函数转换为接口传参
+//Q: 为什么不直接传递函数？而要传递一个接口？
+//A: 传递接口更加的通用，方便扩展，比如在接口内新增加方法，如果传递函数就固定了，而且传递函数还依赖闭包机制
 type GetterFunc func(key string) ([]byte, error)
 
 func (f GetterFunc) Get(key string) ([]byte, error) {
@@ -70,6 +75,7 @@ func (g *Group) Get(key string) (ByteView, error) {
 }
 
 func (g *Group) load(key string) (value ByteView, err error) {
+	time.Sleep(100 * time.Millisecond) //测试缓存击穿
 	//通过singleflight去加载
 	view, err := g.loader.Do(key, func() (interface{}, error) {
 		if g.peers != nil {

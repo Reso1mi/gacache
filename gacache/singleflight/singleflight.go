@@ -5,13 +5,14 @@ import "sync"
 //封装每个请求/调用
 type call struct {
 	wg  sync.WaitGroup
-	val interface{}
-	err error
+	val interface{} //请求的值
+	err error       //err
 }
 
+//singleflight核心结构
 type Group struct {
 	mu sync.Mutex
-	m  map[string]*call
+	m  map[string]*call //key与call的映射
 }
 
 //并发请求控制

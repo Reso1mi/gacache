@@ -60,7 +60,7 @@ func (c *Cache) RemoveOldest() {
 
 //新增or修改
 func (c *Cache) Put(key string, value Value) {
-	if ele, ok := c.cache[key]; ok {
+	if ele, ok := c.cache[key]; ok { //修改
 		c.ll.MoveToFront(ele)
 		kv := ele.Value.(*entry)
 		c.nbytes += int64(value.Len()) - int64(kv.value.Len())
