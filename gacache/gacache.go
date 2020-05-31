@@ -6,7 +6,6 @@ import (
 	"gacache/singleflight"
 	"log"
 	"sync"
-	"time"
 )
 
 //cache miss时候的回调接口
@@ -75,7 +74,8 @@ func (g *Group) Get(key string) (ByteView, error) {
 }
 
 func (g *Group) load(key string) (value ByteView, err error) {
-	time.Sleep(100 * time.Millisecond) //测试缓存击穿
+	//放大缓存击穿效果
+	//time.Sleep(100 * time.Millisecond)
 	//通过singleflight去加载
 	view, err := g.loader.Do(key, func() (interface{}, error) {
 		if g.peers != nil {
