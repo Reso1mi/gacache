@@ -5,8 +5,14 @@ import (
 	pb "gacache/gacachepb"
 	"gacache/singleflight"
 	"log"
+	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+//每分钟远程获取的QPS上限
+const maxMinuteRemoteQPS = 10
 
 //cache miss时候的回调接口
 type Getter interface {
@@ -26,9 +32,30 @@ type Group struct {
 	name      string
 	getter    Getter
 	mainCache cache
+	hotCache  cache
 	peers     PeerPicker
 	//singleflight并发请求控制
 	loader *singleflight.Group
+	//KeyStats映射
+	keys map[string]*KeyStats
+}
+
+//封装一个原子类
+type AtomicInt int64
+
+//原子自增
+func (i *AtomicInt) Add(n int64) {
+	atomic.AddInt64((*int64)(i), n)
+}
+
+func (i *AtomicInt) Get() int64 {
+	return atomic.LoadInt64((*int64)(i))
+}
+
+//Key的统计信息
+type KeyStats struct {
+	firstGetTime time.Time
+	remoteCnt    AtomicInt //利用atomic包封装的原子类
 }
 
 var (
@@ -46,8 +73,10 @@ func NewGroup(name string, cacheByte int64, getter Getter) *Group {
 	g := &Group{
 		name:      name,
 		getter:    getter,
-		mainCache: cache{cacheBytes: cacheByte},
+		mainCache: cache{cacheBytes: cacheByte * 7 / 8},
+		hotCache:  cache{cacheBytes: cacheByte / 8},
 		loader:    &singleflight.Group{},
+		keys:      map[string]*KeyStats{},
 	}
 	groups[name] = g
 	return g
@@ -66,7 +95,12 @@ func (g *Group) Get(key string) (ByteView, error) {
 		return ByteView{}, fmt.Errorf("key nil")
 	}
 	if v, ok := g.mainCache.get(key); ok {
-		log.Printf("[GaCache] hit")
+		log.Printf("[GaCache (mainCache)] hit")
+		return v, nil
+	}
+	//add: hotCache
+	if v, ok := g.hotCache.get(key); ok {
+		log.Printf("[GaCache (hotCache)] hit")
 		return v, nil
 	}
 	//当前节点没有数据,去其他地方加载
@@ -110,6 +144,27 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	if err != nil {
 		return ByteView{}, err
 	}
+	//远程获取cnt++
+	if stat, ok := g.keys[key]; ok {
+		stat.remoteCnt.Add(1)
+		//计算QPS
+		interval := float64(time.Now().Unix()-stat.firstGetTime.Unix()) / 60
+		qps := stat.remoteCnt.Get() / int64(math.Max(1, math.Round(interval)))
+		if qps >= maxMinuteRemoteQPS {
+			//存入hotCache
+			g.populateCache(key, ByteView{b: res.Value}, &g.hotCache)
+			//删除映射关系,节省内存
+			mu.Lock()
+			delete(g.keys, key)
+			mu.Unlock()
+		}
+	} else {
+		//第一次获取
+		g.keys[key] = &KeyStats{
+			firstGetTime: time.Now(),
+			remoteCnt:    1,
+		}
+	}
 	return ByteView{b: res.Value}, nil
 }
 
@@ -121,13 +176,14 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	}
 	//将数据源的数据拷贝一份放入cache中，防止其他外部程序占有该数据并修改
 	value := ByteView{b: cloneBytes(bytes)}
-	g.populateCache(key, value)
+	g.populateCache(key, value, &g.mainCache)
 	return value, nil
 }
 
 //将从数据源获取的数据加入cache
-func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.put(key, value)
+//update: hotCache
+func (g *Group) populateCache(key string, value ByteView, c *cache) {
+	c.put(key, value)
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {

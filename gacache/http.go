@@ -23,7 +23,7 @@ type HTTPPool struct {
 	basePath    string //节点间通讯地址的前缀,默认是'/_gacache/'
 	mu          sync.Mutex
 	peers       *consistenthash.Map    //一致性Hash算法
-	httpGetters map[string]*httpGetter //每个远程节点对应一个httpGetter(节点的ip:port)
+	httpGetters map[string]*httpGetter //每个远程节点对应一个httpGetter(节点的ip:port/defaultPath)
 }
 
 func NewHTTPPool(self string) *HTTPPool {
@@ -37,6 +37,7 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
 }
 
+//http服务端
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !strings.HasPrefix(req.URL.Path, p.basePath) {
 		panic("HTTPPool serving unexpect path")
@@ -99,7 +100,7 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 var _ PeerPicker = (*HTTPPool)(nil)
 
 //http客户端,用于向远程节点请求数据
-//其实可以直接理解成远程节点的地址 eg. localhost:8002
+//其实可以直接理解为存远程节点的地址的结构 eg. localhost:8002/defaultPath
 type httpGetter struct {
 	baseURL string
 }

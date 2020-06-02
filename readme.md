@@ -1,8 +1,36 @@
-[TOC]
+## TOC
+
+
+- [简介](#简介)
+- [整体流程](#整体流程)
+- [LRU队列](#LRU队列)
+- [并发控制](#并发控制)
+- [一致性Hash](#一致性Hash)
+  * [实现](#实现)
+- [分布式节点通信](#分布式节点通信)
+  * [Client端](#Client端)
+  * [Server端](#Server端)
+- [热点互备](#热点互备)
+  * [思路](#思路)
+  * [测试](#测试)
+- [缓存击穿](#缓存击穿)
+  * [复现](#复现)
+  * [解决方案](#解决方案)
+  * [测试](#测试-1)
+- [缓存穿透](#缓存穿透)
+  * [复现](#复现-1)
+  * [解决方案](#解决方案1)
+- [TODO](#TODO)
+
+## 简介
+
+本项目是模仿[groupcache](https://github.com/golang/groupcache)实现的一个分布式缓存库，其可以作为单独服务部署，亦可以作为一个`lib`来用，使用一致性Hash进行节点的选取和数据的分片，节点之间采用http协议进行通信，使用[Protobuf](https://github.com/protocolbuffers/protobuf)序列化数据进行传输，提高传输效率，节点之间支持热点数据互备，减少网络开销，同时还实现了并发访问控制机制，防止缓存击穿，相比于原项目，对热点互备的功能进行了增强
+
+> 本项目为练手项目，不可用于生产
 
 ## 整体流程
 
-![mark](http://static.imlgw.top/blog/20200528/5UiOdagYdU2H.png?imageslim)
+![mark](http://static.imlgw.top/blog/20200602/Glc7aMrySiqF.png?imageslim)
 
 ## LRU队列
 
@@ -186,6 +214,142 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 ```
 
+## 热点互备
+
+热点互备也是`groupcache`的特点之一，在源码注释中写到
+
+> hotCache contains keys/values for which this peer is not authoritative (otherwise they would be in **mainCache**), but are popular enough to warrant mirroring in this process to avoid going over the network to fetch from a peer.  Having a hotCache avoids network hotspotting, where a peer's network card could become the bottleneck on a popular key. This cache is used sparingly to maximize the total number of key/value pairs that can be stored globally.
+
+大致意思就是，`hotCache`中存储的主要是该节点没有的键值对（否则就在`mainCache`中了），但是这些键值对请求的非常频繁，所以需要保证在此过程中进行热点备份，避免通过网络从远程节点去获取，`hotCache`避免了网络热点，使节点的网卡成为热点`key`的瓶颈
+
+但是在`groupcache`中对`hotCache`的处理只是随机的存储，每次从远程节点获取数据的时候有1/10的概率存储到`hotCache`中（[code](https://github.com/golang/groupcache/blob/master/groupcache.go#L318)）
+
+![mark](http://static.imlgw.top/blog/20200601/A0oPStJGqht3.png?imageslim)
+
+可以看到这是一个TODO，注释中也提到了可以使用QPS来判断是否是热点`key`，所以我按照这个想法写了一个简单的统计
+
+### 思路
+
+首先我们需要添加一个`hotCache`的结构，这个cache和`mainCache`一样，都是并发安全的`lru`队列，然后我们在向某个节点请求数据的时候就可以先从`mainCache`中请求如果没有就从`hotCache`中请求 ，如下
+
+```go
+func (g *Group) Get(key string) (ByteView, error) {
+    if key == "" {
+        return ByteView{}, fmt.Errorf("key nil")
+    }
+    if v, ok := g.mainCache.get(key); ok {
+        log.Printf("[GaCache (mainCache)] hit")
+        return v, nil
+    }
+    //add: hotCache
+    if v, ok := g.hotCache.get(key); ok {
+        log.Printf("[GaCache (hotCache)] hit")
+        return v, nil
+    }
+    //当前节点没有数据,去其他地方加载
+    return g.load(key)
+}
+```
+
+然后封装了一个`KeyStats`的结构，用于统计`key`的请求信息
+
+```go
+//Key的统计信息
+type KeyStats struct {
+    firstGetTime time.Time //第一次请求的时间
+    remoteCnt    AtomicInt //请求的次数（利用atomic包封装的原子类）
+}
+```
+
+除此之外，还需要将`key`和`KeyStats`对应，所以需要在cache的核心结构`Group`中加入映射关系
+
+```go
+type Group struct {
+    //...
+    keys map[string]*KeyStats
+}
+```
+
+然后在节点请求远程节点的时候统计请求的信息，也就是`getFromPeer`函数中
+
+```go
+//从远程节点获取数据
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+    //构建proto的message
+    req := &pb.Request{
+        Group: g.name,
+        Key:   key,
+    }
+    res := &pb.Response{}
+    err := peer.Get(req, res)
+
+    fmt.Println("getFromPeer", key)
+    if err != nil {
+        return ByteView{}, err
+    }
+    //远程获取cnt++
+    if stat, ok := g.keys[key]; ok {
+        stat.remoteCnt.Add(1)
+        //计算QPS
+        interval := float64(time.Now().Unix()-stat.firstGetTime.Unix()) / 60
+        qps := stat.remoteCnt.Get() / int64(math.Max(1, math.Round(interval)))
+        if qps >= maxMinuteRemoteQPS {
+            //存入hotCache
+            g.populateCache(key, ByteView{b: res.Value}, &g.hotCache)
+            //删除映射关系,节省内存
+            mu.Lock()
+            delete(g.keys, key)
+            mu.Unlock()
+        }
+    } else {
+        //第一次获取
+        g.keys[key] = &KeyStats{
+            firstGetTime: time.Now(),
+            remoteCnt:    1,
+        }
+    }
+    return ByteView{b: res.Value}, nil
+}
+```
+
+`maxMinuteRemoteQPS`是一个常量，每个key每分钟远程请求最大的QPS，每次向远程节点请求数据的时候计算当前`key`第一次获取的时间到目前为止的QPS，如果大于阈值`maxMinuteRemoteQPS`，就会将其存入`hotCache`中，之后就可以直接从`hotCache`中获取数据，而不用在通过网络去获取
+
+### 测试
+
+同样使用前面的go脚本来测试
+
+```go
+func main() {
+    for i := 0; i < 20; i++ {
+        wg.Add(1)
+        //go curl("resolmi")
+        //i not exist
+        //go curl(strconv.Itoa(i))
+        time.Sleep(500 * time.Millisecond)
+        curl("resolmi")
+    }
+    wg.Wait()
+    fmt.Println("Done!")
+}
+
+func curl(key string) {
+    res, _ := http.Get("http://localhost:9999/api?key=" + key)
+    bytes, _ := ioutil.ReadAll(res.Body)
+    fmt.Println(string(bytes))
+    wg.Done()
+}
+```
+
+> 注意这里请求不要请求太快，如果一个key请求的太快会被`singleFlight`并发控制组件拦截，多数请求不会走网络（这个组件作用还是挺大的），所以并没有使用`goroutine`，而是正常的调用，并且中间停顿0.5s
+
+这里为了方便模拟，我设置了 `maxMinuteRemoteQPS = 10` ，上面的脚本一分钟之内会请求`“resolmi”` 20次，这个`key`的分片已知是远程节点（8003）的，所以会在第10次的时候触发`hotCache`，将数据存入当前节点（8004）的`hotCache`中，后续的请求就会直接从`hotCache`中取，如下图所演示
+
+![mark](http://static.imlgw.top/blog/20200602/hKH8u6E1gpcA.gif)
+
+可以看到效果确实达到了，但是这样做有一个比较大的缺点就是内存耗费会比原来大，需要额外维护一个map，不过这部分信息并不大，仅仅需要存储`key`和对应`keyStats` ，key的长度一般不会很长，`keyStats` 的长度是固定的，一个`time`和一个`int64`，所以一定程度上还是可行的。
+
+> 这种方案只是我能想到的一种比较简单的处理方法，肯定会有更好的处理方式。但是截至目前（2020.6.2）`groupcache`中没有对这里进行改进，如果以后有更新可以再学习下
+
 ## 缓存击穿
 
 一个存在的`key`突然失效，在失效的同时有大量的请求来请求这个`key`，这个时候大量请求就会直接打到DB，导致DB压力变大，甚至宕机
@@ -206,19 +370,17 @@ start go run .  -port=8004 -api=1
 尝试了用window的批处理写并发访问的脚本，但是效果不是很好，所以直接用`go`写了个小脚本测试并发请求
 
 ```go
-var wg sync.WaitGroup
-
 func main() {
     for i := 0; i < 5; i++ {
         wg.Add(1)
-        go curl()
+        go curl("resolmi")
     }
     wg.Wait()
     fmt.Println("Done!")
 }
 
-func curl() {
-    res, _ := http.Get("http://localhost:9999/api?key=resolmi")
+func curl(key string) {
+    res, _ := http.Get("http://localhost:9999/api?key=" + key)
     bytes, _ := ioutil.ReadAll(res.Body)
     fmt.Println(string(bytes))
     wg.Done()
@@ -345,15 +507,15 @@ view, err := g.loader.Do(key, func() (interface{}, error) {
 func main() {
     for i := 0; i < 5; i++ {
         wg.Add(1)
-        //go curl()
+        //go curl("resolmi")
         //i not exist
-        go curlNotExist(strconv.Itoa(i)) //构造不用的key
+        go  curl(strconv.Itoa(i))
     }
     wg.Wait()
     fmt.Println("Done!")
 }
 
-func curlNotExist(key string) {
+func curl(key string) {
     res, _ := http.Get("http://localhost:9999/api?key=" + key)
     bytes, _ := ioutil.ReadAll(res.Body)
     fmt.Println(string(bytes))
@@ -391,13 +553,9 @@ func curlNotExist(key string) {
 
 当业务层有查询请求的时候，首先去`BloomFilter`中查询该key是否存在。若不存在，则说明数据库中也不存在该数据，因此缓存都不要查了，直接返回null。若存在，则继续执行后续的流程，先前往缓存中查询，缓存中没有的话再前往数据库中的查询。
 
-这里第一个种方案可以直接排除，一方面因为我们这个cache是不能删除数据的，只能被动的淘汰数据，缓存大量的空对象且得不到及时的删除会浪费大量内存，另一方面，缓存空对象的做法如果每次查询的不存在的key的不一样，那么这种方案也就起不到作用了
+这里第一个种方案可以直接排除，一方面因为我们这个cache是不能删除数据的，只能被动的淘汰数据，缓存大量的空对象且得不到及时的删除会浪费大量内存，另一方面，缓存空对象的做法，如果每次查询的不存在的`key`都不一样，那么这种方案也就起不到作用了
 
 至于第二种方案，可行，但是不应该在缓存层来做，应该在业务层处理，也就是在上层处理，因为这是一个分布式的缓存组件，每个节点的数据都是不一样的，用布隆过滤器你只能判断在**当前节点**有没有，无法判断**远程节点**有没有，所以一开始就要将所有数据预热到布隆过滤器中，但是这样每一个节点都会需要一个布隆过滤器，这样做没有任何意义，所以缓存穿透的问题应该放到应用层去处理
-
-## 部署方案
-
-
 
 ## TODO
 
@@ -405,4 +563,6 @@ func curlNotExist(key string) {
 - [x] 一致性Hash
 - [x] 缓存击穿
 - [x] 布隆过滤器
-- [ ] 热点互备
+- [x] 热点互备
+- [ ] 配置解耦
+- [ ] 集群管理

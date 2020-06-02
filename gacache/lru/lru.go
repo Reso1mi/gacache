@@ -23,7 +23,7 @@ type Value interface {
 	Len() int //返回值占用内存大小
 }
 
-//New 最大可用内存0代表无限 key失效回调
+//New maxBytes:最大可用内存,0代表无限 onEvicted:失效回调函数
 func New(maxBytes int64, onEvicted func(key string, value Value)) *Cache {
 	return &Cache{
 		maxBytes:  maxBytes,
