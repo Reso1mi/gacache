@@ -10,13 +10,13 @@
 - [分布式节点通信](#分布式节点通信)
   * [Client端](#Client端)
   * [Server端](#Server端)
-- [热点互备](#热点互备)
-  * [思路](#思路)
-  * [测试](#测试)
 - [缓存击穿](#缓存击穿)
   * [复现](#复现)
   * [解决方案](#解决方案)
   * [测试](#测试-1)
+- [热点互备](#热点互备)
+  * [思路](#思路)
+  * [测试](#测试)
 - [缓存穿透](#缓存穿透)
   * [复现](#复现-1)
   * [解决方案](#解决方案1)
@@ -214,142 +214,6 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 ```
 
-## 热点互备
-
-热点互备也是`groupcache`的特点之一，在源码注释中写到
-
-> hotCache contains keys/values for which this peer is not authoritative (otherwise they would be in **mainCache**), but are popular enough to warrant mirroring in this process to avoid going over the network to fetch from a peer.  Having a hotCache avoids network hotspotting, where a peer's network card could become the bottleneck on a popular key. This cache is used sparingly to maximize the total number of key/value pairs that can be stored globally.
-
-大致意思就是，`hotCache`中存储的主要是该节点没有的键值对（否则就在`mainCache`中了），但是这些键值对请求的非常频繁，所以需要保证在此过程中进行热点备份，避免通过网络从远程节点去获取，`hotCache`避免了网络热点，使节点的网卡成为热点`key`的瓶颈
-
-但是在`groupcache`中对`hotCache`的处理只是随机的存储，每次从远程节点获取数据的时候有1/10的概率存储到`hotCache`中（[code](https://github.com/golang/groupcache/blob/master/groupcache.go#L318)）
-
-![mark](http://static.imlgw.top/blog/20200601/A0oPStJGqht3.png?imageslim)
-
-可以看到这是一个TODO，注释中也提到了可以使用QPS来判断是否是热点`key`，所以我按照这个想法写了一个简单的统计
-
-### 思路
-
-首先我们需要添加一个`hotCache`的结构，这个cache和`mainCache`一样，都是并发安全的`lru`队列，然后我们在向某个节点请求数据的时候就可以先从`mainCache`中请求如果没有就从`hotCache`中请求 ，如下
-
-```go
-func (g *Group) Get(key string) (ByteView, error) {
-    if key == "" {
-        return ByteView{}, fmt.Errorf("key nil")
-    }
-    if v, ok := g.mainCache.get(key); ok {
-        log.Printf("[GaCache (mainCache)] hit")
-        return v, nil
-    }
-    //add: hotCache
-    if v, ok := g.hotCache.get(key); ok {
-        log.Printf("[GaCache (hotCache)] hit")
-        return v, nil
-    }
-    //当前节点没有数据,去其他地方加载
-    return g.load(key)
-}
-```
-
-然后封装了一个`KeyStats`的结构，用于统计`key`的请求信息
-
-```go
-//Key的统计信息
-type KeyStats struct {
-    firstGetTime time.Time //第一次请求的时间
-    remoteCnt    AtomicInt //请求的次数（利用atomic包封装的原子类）
-}
-```
-
-除此之外，还需要将`key`和`KeyStats`对应，所以需要在cache的核心结构`Group`中加入映射关系
-
-```go
-type Group struct {
-    //...
-    keys map[string]*KeyStats
-}
-```
-
-然后在节点请求远程节点的时候统计请求的信息，也就是`getFromPeer`函数中
-
-```go
-//从远程节点获取数据
-func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-    //构建proto的message
-    req := &pb.Request{
-        Group: g.name,
-        Key:   key,
-    }
-    res := &pb.Response{}
-    err := peer.Get(req, res)
-
-    fmt.Println("getFromPeer", key)
-    if err != nil {
-        return ByteView{}, err
-    }
-    //远程获取cnt++
-    if stat, ok := g.keys[key]; ok {
-        stat.remoteCnt.Add(1)
-        //计算QPS
-        interval := float64(time.Now().Unix()-stat.firstGetTime.Unix()) / 60
-        qps := stat.remoteCnt.Get() / int64(math.Max(1, math.Round(interval)))
-        if qps >= maxMinuteRemoteQPS {
-            //存入hotCache
-            g.populateCache(key, ByteView{b: res.Value}, &g.hotCache)
-            //删除映射关系,节省内存
-            mu.Lock()
-            delete(g.keys, key)
-            mu.Unlock()
-        }
-    } else {
-        //第一次获取
-        g.keys[key] = &KeyStats{
-            firstGetTime: time.Now(),
-            remoteCnt:    1,
-        }
-    }
-    return ByteView{b: res.Value}, nil
-}
-```
-
-`maxMinuteRemoteQPS`是一个常量，每个key每分钟远程请求最大的QPS，每次向远程节点请求数据的时候计算当前`key`第一次获取的时间到目前为止的QPS，如果大于阈值`maxMinuteRemoteQPS`，就会将其存入`hotCache`中，之后就可以直接从`hotCache`中获取数据，而不用在通过网络去获取
-
-### 测试
-
-同样使用前面的go脚本来测试
-
-```go
-func main() {
-    for i := 0; i < 20; i++ {
-        wg.Add(1)
-        //go curl("resolmi")
-        //i not exist
-        //go curl(strconv.Itoa(i))
-        time.Sleep(500 * time.Millisecond)
-        curl("resolmi")
-    }
-    wg.Wait()
-    fmt.Println("Done!")
-}
-
-func curl(key string) {
-    res, _ := http.Get("http://localhost:9999/api?key=" + key)
-    bytes, _ := ioutil.ReadAll(res.Body)
-    fmt.Println(string(bytes))
-    wg.Done()
-}
-```
-
-> 注意这里请求不要请求太快，如果一个key请求的太快会被`singleFlight`并发控制组件拦截，多数请求不会走网络（这个组件作用还是挺大的），所以并没有使用`goroutine`，而是正常的调用，并且中间停顿0.5s
-
-这里为了方便模拟，我设置了 `maxMinuteRemoteQPS = 10` ，上面的脚本一分钟之内会请求`“resolmi”` 20次，这个`key`的分片已知是远程节点（8003）的，所以会在第10次的时候触发`hotCache`，将数据存入当前节点（8004）的`hotCache`中，后续的请求就会直接从`hotCache`中取，如下图所演示
-
-![mark](http://static.imlgw.top/blog/20200602/hKH8u6E1gpcA.gif)
-
-可以看到效果确实达到了，但是这样做有一个比较大的缺点就是内存耗费会比原来大，需要额外维护一个map，不过这部分信息并不大，仅仅需要存储`key`和对应`keyStats` ，key的长度一般不会很长，`keyStats` 的长度是固定的，一个`time`和一个`int64`，所以一定程度上还是可行的。
-
-> 这种方案只是我能想到的一种比较简单的处理方法，肯定会有更好的处理方式。但是截至目前（2020.6.2）`groupcache`中没有对这里进行改进，如果以后有更新可以再学习下
-
 ## 缓存击穿
 
 一个存在的`key`突然失效，在失效的同时有大量的请求来请求这个`key`，这个时候大量请求就会直接打到DB，导致DB压力变大，甚至宕机
@@ -494,6 +358,142 @@ view, err := g.loader.Do(key, func() (interface{}, error) {
 ![mark](http://static.imlgw.top/blog/20200530/ChE0FxjwlYbl.png?imageslim)
 
 从`SlowDB`的查询也只执行了一次，说明我们的`singleFlight`并发控制生效了！
+
+## 热点互备
+
+热点互备也是`groupcache`的特点之一，在源码注释中写到
+
+> hotCache contains keys/values for which this peer is not authoritative (otherwise they would be in **mainCache**), but are popular enough to warrant mirroring in this process to avoid going over the network to fetch from a peer.  Having a hotCache avoids network hotspotting, where a peer's network card could become the bottleneck on a popular key. This cache is used sparingly to maximize the total number of key/value pairs that can be stored globally.
+
+大致意思就是，`hotCache`中存储的主要是该节点没有的键值对（否则就在`mainCache`中了），但是这些键值对请求的非常频繁，所以需要保证在此过程中进行热点备份，避免通过网络从远程节点去获取，`hotCache`避免了网络热点，使节点的网卡成为热点`key`的瓶颈
+
+但是在`groupcache`中对`hotCache`的处理只是随机的存储，每次从远程节点获取数据的时候有1/10的概率存储到`hotCache`中（[code](https://github.com/golang/groupcache/blob/master/groupcache.go#L318)）
+
+![mark](http://static.imlgw.top/blog/20200601/A0oPStJGqht3.png?imageslim)
+
+可以看到这是一个TODO，注释中也提到了可以使用QPS来判断是否是热点`key`，所以我按照这个想法写了一个简单的统计
+
+### 思路
+
+首先我们需要添加一个`hotCache`的结构，这个cache和`mainCache`一样，都是并发安全的`lru`队列，然后我们在向某个节点请求数据的时候就可以先从`mainCache`中请求如果没有就从`hotCache`中请求 ，如下
+
+```go
+func (g *Group) Get(key string) (ByteView, error) {
+    if key == "" {
+        return ByteView{}, fmt.Errorf("key nil")
+    }
+    if v, ok := g.mainCache.get(key); ok {
+        log.Printf("[GaCache (mainCache)] hit")
+        return v, nil
+    }
+    //add: hotCache
+    if v, ok := g.hotCache.get(key); ok {
+        log.Printf("[GaCache (hotCache)] hit")
+        return v, nil
+    }
+    //当前节点没有数据,去其他地方加载
+    return g.load(key)
+}
+```
+
+然后封装了一个`KeyStats`的结构，用于统计`key`的请求信息
+
+```go
+//Key的统计信息
+type KeyStats struct {
+    firstGetTime time.Time //第一次请求的时间
+    remoteCnt    AtomicInt //请求的次数（利用atomic包封装的原子类）
+}
+```
+
+除此之外，还需要将`key`和`KeyStats`对应，所以需要在cache的核心结构`Group`中加入映射关系
+
+```go
+type Group struct {
+    //...
+    keys map[string]*KeyStats
+}
+```
+
+然后在节点请求远程节点的时候统计请求的信息，也就是`getFromPeer`函数中
+
+```go
+//从远程节点获取数据
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+    //构建proto的message
+    req := &pb.Request{
+        Group: g.name,
+        Key:   key,
+    }
+    res := &pb.Response{}
+    err := peer.Get(req, res)
+
+    fmt.Println("getFromPeer", key)
+    if err != nil {
+        return ByteView{}, err
+    }
+    //远程获取cnt++
+    if stat, ok := g.keys[key]; ok {
+        stat.remoteCnt.Add(1)
+        //计算QPS
+        interval := float64(time.Now().Unix()-stat.firstGetTime.Unix()) / 60
+        qps := stat.remoteCnt.Get() / int64(math.Max(1, math.Round(interval)))
+        if qps >= maxMinuteRemoteQPS {
+            //存入hotCache
+            g.populateCache(key, ByteView{b: res.Value}, &g.hotCache)
+            //删除映射关系,节省内存
+            mu.Lock()
+            delete(g.keys, key)
+            mu.Unlock()
+        }
+    } else {
+        //第一次获取
+        g.keys[key] = &KeyStats{
+            firstGetTime: time.Now(),
+            remoteCnt:    1,
+        }
+    }
+    return ByteView{b: res.Value}, nil
+}
+```
+
+`maxMinuteRemoteQPS`是一个常量，每个key每分钟远程请求最大的QPS，每次向远程节点请求数据的时候计算当前`key`第一次获取的时间到目前为止的QPS，如果大于阈值`maxMinuteRemoteQPS`，就会将其存入`hotCache`中，之后就可以直接从`hotCache`中获取数据，而不用在通过网络去获取
+
+### 测试
+
+同样使用前面的go脚本来测试
+
+```go
+func main() {
+    for i := 0; i < 20; i++ {
+        wg.Add(1)
+        //go curl("resolmi")
+        //i not exist
+        //go curl(strconv.Itoa(i))
+        time.Sleep(500 * time.Millisecond)
+        curl("resolmi")
+    }
+    wg.Wait()
+    fmt.Println("Done!")
+}
+
+func curl(key string) {
+    res, _ := http.Get("http://localhost:9999/api?key=" + key)
+    bytes, _ := ioutil.ReadAll(res.Body)
+    fmt.Println(string(bytes))
+    wg.Done()
+}
+```
+
+> 注意这里请求不要请求太快，如果一个key请求的太快会被`singleFlight`并发控制组件拦截，多数请求不会走网络（这个组件作用还是挺大的），所以并没有使用`goroutine`，而是正常的调用，并且中间停顿0.5s
+
+这里为了方便模拟，我设置了 `maxMinuteRemoteQPS = 10` ，上面的脚本一分钟之内会请求`“resolmi”` 20次，这个`key`的分片已知是远程节点（8003）的，所以会在第10次的时候触发`hotCache`，将数据存入当前节点（8004）的`hotCache`中，后续的请求就会直接从`hotCache`中取，如下图所演示
+
+![mark](http://static.imlgw.top/blog/20200602/hKH8u6E1gpcA.gif)
+
+可以看到效果确实达到了，但是这样做有一个比较大的缺点就是内存耗费会比原来大，需要额外维护一个map，不过这部分信息并不大，仅仅需要存储`key`和对应`keyStats` ，key的长度一般不会很长，`keyStats` 的长度是固定的，一个`time`和一个`int64`，所以一定程度上还是可行的。
+
+> 这种方案只是我能想到的一种比较简单的处理方法，肯定会有更好的处理方式。但是截至目前（2020.6.2）`groupcache`中没有对这里进行改进，如果以后有更新可以再学习下
 
 ## 缓存穿透
 
